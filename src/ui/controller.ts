@@ -16,10 +16,12 @@ const ID_OF: Record<Btn, string> = {
 
 export class Controller {
   private els = new Map<Btn, SVGElement>();
+  readonly el: HTMLElement;
 
-  constructor(root: HTMLElement, bus: InputBus) {
+  constructor(root: HTMLElement, bus: InputBus, positionClass = 'pad-solo') {
     const wrap = document.createElement('div');
-    wrap.id = 'controller';
+    wrap.className = `controller ${positionClass}`;
+    this.el = wrap;
     wrap.innerHTML = `
       <svg viewBox="0 0 300 132" xmlns="http://www.w3.org/2000/svg">
         <rect x="4" y="8" width="292" height="116" rx="28" fill="#0d1428" stroke="#2b3a66" stroke-width="1.5"/>
@@ -57,5 +59,13 @@ export class Controller {
       if (!el) return;
       el.classList.toggle('lit', e.pressed);
     });
+  }
+
+  setVisible(v: boolean): void {
+    this.el.style.display = v ? '' : 'none';
+  }
+
+  setPositionClass(cls: string): void {
+    this.el.className = `controller ${cls}`;
   }
 }

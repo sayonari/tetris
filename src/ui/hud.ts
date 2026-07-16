@@ -1,11 +1,12 @@
 // HUD：スコアパネル・ネクスト/ホールド表示・アクションテキスト・
 // タイトル/ポーズ/ゲームオーバー画面
 
-import { COLORS, ClearInfo, Game, PieceType, SHAPES } from '../core/tetris';
+import { ClearInfo, Game } from '../core/tetris';
 import { StrategyId } from '../ai/ai';
 import { pickFeeling } from './feelings';
+import { drawMino } from './preview';
 
-const cssColor = (hex: number) => '#' + hex.toString(16).padStart(6, '0');
+export type TitleChoice = 'auto' | 'manual' | 'vs-cpu' | 'vs-human';
 
 const STRATEGY_META: Record<StrategyId | 'manual', { en: string; ja: string; color: string }> = {
   tspin: { en: 'T-SPIN HUNT', ja: 'Tスピン狙い', color: '#d38bff' },
@@ -171,41 +172,12 @@ export class HUD {
     }
   }
 
-  private drawMino(
-    ctx: CanvasRenderingContext2D,
-    type: PieceType,
-    centerX: number,
-    centerY: number,
-    cell: number,
-  ): void {
-    const cells = SHAPES[type][0];
-    const xs = cells.map(([x]) => x);
-    const ys = cells.map(([, y]) => y);
-    const w = (Math.max(...xs) - Math.min(...xs) + 1) * cell;
-    const h = (Math.max(...ys) - Math.min(...ys) + 1) * cell;
-    const ox = centerX - w / 2 - Math.min(...xs) * cell;
-    const oy = centerY - h / 2 - Math.min(...ys) * cell;
-    const color = cssColor(COLORS[type]);
-    ctx.save();
-    ctx.shadowColor = color;
-    ctx.shadowBlur = 9;
-    ctx.fillStyle = color;
-    for (const [x, y] of cells) {
-      const px = ox + x * cell;
-      const py = oy + y * cell;
-      ctx.beginPath();
-      ctx.roundRect(px + 1, py + 1, cell - 2, cell - 2, 3);
-      ctx.fill();
-    }
-    ctx.restore();
-  }
-
   drawHold(): void {
     const ctx = this.holdCtx;
     ctx.clearRect(0, 0, 96, 64);
     if (this.game.holdType) {
       ctx.globalAlpha = this.game.canHold ? 1 : 0.35;
-      this.drawMino(ctx, this.game.holdType, 48, 32, 13);
+      drawMino(ctx, this.game.holdType, 48, 32, 13);
       ctx.globalAlpha = 1;
     }
   }
@@ -216,9 +188,19 @@ export class HUD {
     const types = this.game.nextTypes(5);
     types.forEach((t, i) => {
       ctx.globalAlpha = i === 0 ? 1 : 0.85 - i * 0.12;
-      this.drawMino(ctx, t, 48, 36 + i * 64, i === 0 ? 14 : 12);
+      drawMino(ctx, t, 48, 36 + i * 64, i === 0 ? 14 : 12);
     });
     ctx.globalAlpha = 1;
+  }
+
+  // ソロ用UI（サイドパネル・バッジ・戦略バナー・気持ちバブル）の表示切替
+  setSoloVisible(v: boolean): void {
+    const d = v ? '' : 'none';
+    (document.getElementById('panel-left') as HTMLElement).style.display = d;
+    (document.getElementById('panel-right') as HTMLElement).style.display = d;
+    this.badge.style.display = d;
+    this.strategyBanner.style.display = v ? '' : 'none';
+    this.feelingEl.style.display = d;
   }
 
   private showClear(info: ClearInfo): void {
@@ -293,20 +275,26 @@ export class HUD {
     }
   }
 
-  showTitle(onSelect: (auto: boolean) => void): void {
+  showTitle(onSelect: (choice: TitleChoice) => void): void {
     const el = this.overlay(`
       <h1 class="logo">NEON TETRIS</h1>
       <div class="subtitle">オートプレイ観賞型 3D テトリス</div>
-      <button class="menu-btn" id="m-auto">▶ オートプレイ観賞</button>
-      <button class="menu-btn" id="m-manual">🎮 自分でプレイ</button>
+      <div class="menu-grid">
+        <button class="menu-btn" id="m-auto">▶ オートプレイ観賞</button>
+        <button class="menu-btn" id="m-manual">🎮 自分でプレイ</button>
+        <button class="menu-btn" id="m-vs-cpu">⚔ CPU対戦を観戦</button>
+        <button class="menu-btn" id="m-vs-human">🥊 CPUと対戦</button>
+      </div>
       <div class="help">
         ←→ 移動　↓ ソフトドロップ　SPACE ハードドロップ<br>
         ↑ / X 右回転　Z 左回転　C / SHIFT ホールド<br>
         A オート切替　M サウンド　ENTER スタート／ポーズ　🎮 ゲームパッド対応
       </div>
     `);
-    el.querySelector('#m-auto')!.addEventListener('click', () => onSelect(true));
-    el.querySelector('#m-manual')!.addEventListener('click', () => onSelect(false));
+    el.querySelector('#m-auto')!.addEventListener('click', () => onSelect('auto'));
+    el.querySelector('#m-manual')!.addEventListener('click', () => onSelect('manual'));
+    el.querySelector('#m-vs-cpu')!.addEventListener('click', () => onSelect('vs-cpu'));
+    el.querySelector('#m-vs-human')!.addEventListener('click', () => onSelect('vs-human'));
   }
 
   showCountdown(done: () => void): void {

@@ -421,6 +421,22 @@ export class AudioEngine {
     this.arp([64, 62, 60, 57, 55, 52, 48, 45], 0.14, 0.3, 0.1);
   }
 
+  attack(power: number): void {
+    this.blip(500, 0.14, 0.12, 'sawtooth', 900 + power * 120);
+    this.noiseHit(0.08, 0.08, 2500);
+  }
+
+  garbageRise(rows: number): void {
+    this.blip(90, 0.22, 0.2, 'triangle', 55);
+    this.noiseHit(0.18, 0.14, 350);
+    if (rows >= 4) this.blip(70, 0.3, 0.16, 'sawtooth', 45);
+  }
+
+  win(): void {
+    this.stopMusic();
+    this.arp([60, 64, 67, 72, 76, 79, 84, 88], 0.07, 0.28, 0.11);
+  }
+
   // ゲームイベントとの接続
   bind(game: Game): void {
     game.on('move', () => this.move());
@@ -432,6 +448,7 @@ export class AudioEngine {
     });
     game.on('hold', () => this.hold());
     game.on('clear', (info) => this.clear(info as ClearInfo));
+    game.on('garbage', (rows) => this.garbageRise(rows as number));
     game.on('levelup', (lv) => {
       this.levelUp();
       this.setLevel(lv as number);

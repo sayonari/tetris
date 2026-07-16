@@ -1,5 +1,6 @@
-// Three.js 3Dレンダラ
-// ネオン発光フレーム・角丸ブロック・Bloomポストプロセス・パーティクル・画面シェイク
+// Three.js 3Dレンダラ（複数盤面対応）
+// BoardView = 1盤面分の3Dオブジェクト一式（フレーム・ブロック・エフェクト）をGroupに内包。
+// ソロ=1面／対戦=2面を同一シーン・同一カメラで描画する。
 
 import * as THREE from 'three';
 import { RoundedBoxGeometry } from 'three/examples/jsm/geometries/RoundedBoxGeometry.js';
@@ -39,12 +40,12 @@ interface Ring {
   max: number;
 }
 
+const VS_OFFSET = 7.6; // 対戦時の盤面中心オフセット
 
-export class Renderer3D {
-  private renderer: THREE.WebGLRenderer;
-  private scene: THREE.Scene;
-  private camera: THREE.PerspectiveCamera;
-  private composer: EffectComposer;
+const cellGeo = new RoundedBoxGeometry(0.92, 0.92, 0.92, 3, 0.13);
+
+class BoardView {
+  group = new THREE.Group();
 
   private lockedMesh: THREE.InstancedMesh;
   private activeBoxes: THREE.Mesh[] = [];
@@ -52,7 +53,8 @@ export class Renderer3D {
   private ghostBoxes: THREE.Mesh[] = [];
   private ghostMat: THREE.MeshBasicMaterial;
   private frameMats: THREE.MeshStandardMaterial[] = [];
-  private starfield: THREE.Points;
+  private flashLight: THREE.PointLight;
+  private garbageBar: THREE.Mesh;
 
   private flashes: Flash[] = [];
   private bursts: Burst[] = [];
@@ -60,71 +62,31 @@ export class Renderer3D {
 
   private dirty = true;
   private greyMode = false;
-  private shake = 0;
   private framePulse = 0;
   private activeSmoothed: { x: number; y: number }[] | null = null;
 
-  private cellGeo: RoundedBoxGeometry;
   private tmpMatrix = new THREE.Matrix4();
   private tmpColor = new THREE.Color();
-  private camBase = new THREE.Vector3(0, 1.6, 24);
-  private flashLight!: THREE.PointLight;
 
   constructor(
-    container: HTMLElement,
+    scene: THREE.Scene,
+    private owner: Renderer3D,
     private game: Game,
+    offsetX: number,
   ) {
-    this.renderer = new THREE.WebGLRenderer({ antialias: true });
-    this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
-    this.renderer.setSize(window.innerWidth, window.innerHeight);
-    this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
-    this.renderer.toneMappingExposure = 1.15;
-    this.renderer.domElement.id = 'gl';
-    container.appendChild(this.renderer.domElement);
+    this.group.position.set(offsetX, 0, 0);
+    scene.add(this.group);
 
-    this.scene = new THREE.Scene();
-    this.scene.background = new THREE.Color(0x04050d);
-    this.scene.fog = new THREE.Fog(0x04050d, 40, 110);
-
-    this.camera = new THREE.PerspectiveCamera(
-      42,
-      window.innerWidth / window.innerHeight,
-      0.1,
-      200,
-    );
-    this.fitCamera();
-
-    // ライティング
-    this.scene.add(new THREE.AmbientLight(0x8899ff, 0.5));
-    const dir = new THREE.DirectionalLight(0xffffff, 2.2);
-    dir.position.set(6, 12, 10);
-    this.scene.add(dir);
-    const p1 = new THREE.PointLight(0x00d5ff, 80, 0, 2);
-    p1.position.set(-10, 6, 9);
-    this.scene.add(p1);
-    const p2 = new THREE.PointLight(0xff2fd0, 80, 0, 2);
-    p2.position.set(10, -6, 9);
-    this.scene.add(p2);
-
-    // 派手演出用フラッシュライト（通常は消灯）
-    this.flashLight = new THREE.PointLight(0xffffff, 0, 0, 1.6);
-    this.flashLight.position.set(0, 0, 6);
-    this.scene.add(this.flashLight);
-
-    this.cellGeo = new RoundedBoxGeometry(0.92, 0.92, 0.92, 3, 0.13);
-
-    // 固定ブロック（インスタンス描画）
     const lockedMat = new THREE.MeshStandardMaterial({
       color: 0xffffff,
       metalness: 0.4,
       roughness: 0.25,
     });
-    this.lockedMesh = new THREE.InstancedMesh(this.cellGeo, lockedMat, COLS * VISIBLE + 8);
+    this.lockedMesh = new THREE.InstancedMesh(cellGeo, lockedMat, COLS * VISIBLE + 8);
     this.lockedMesh.count = 0;
     this.lockedMesh.setColorAt(0, new THREE.Color(1, 1, 1));
-    this.scene.add(this.lockedMesh);
+    this.group.add(this.lockedMesh);
 
-    // 操作中ピース
     this.activeMat = new THREE.MeshStandardMaterial({
       color: 0xffffff,
       emissive: 0xffffff,
@@ -133,53 +95,40 @@ export class Renderer3D {
       roughness: 0.3,
     });
     for (let i = 0; i < 4; i++) {
-      const m = new THREE.Mesh(this.cellGeo, this.activeMat);
-      this.scene.add(m);
+      const m = new THREE.Mesh(cellGeo, this.activeMat);
+      this.group.add(m);
       this.activeBoxes.push(m);
     }
 
-    // ゴースト
     this.ghostMat = new THREE.MeshBasicMaterial({
       color: 0xffffff,
       transparent: true,
       opacity: 0.16,
     });
     for (let i = 0; i < 4; i++) {
-      const m = new THREE.Mesh(this.cellGeo, this.ghostMat);
-      this.scene.add(m);
+      const m = new THREE.Mesh(cellGeo, this.ghostMat);
+      this.group.add(m);
       this.ghostBoxes.push(m);
     }
 
-    this.buildStage();
-    this.starfield = this.buildStarfield();
-    this.bindGameEvents();
+    this.flashLight = new THREE.PointLight(0xffffff, 0, 0, 1.6);
+    this.flashLight.position.set(0, 0, 6);
+    this.group.add(this.flashLight);
 
-    // ポストプロセス（Bloom）
-    this.composer = new EffectComposer(this.renderer);
-    this.composer.addPass(new RenderPass(this.scene, this.camera));
-    const bloom = new UnrealBloomPass(
-      new THREE.Vector2(window.innerWidth, window.innerHeight),
-      0.55,
-      0.45,
-      0.72,
+    // 受けているせり上がり量の警告バー（盤面左側の赤いゲージ）
+    this.garbageBar = new THREE.Mesh(
+      new THREE.BoxGeometry(0.22, 1, 0.6),
+      new THREE.MeshStandardMaterial({
+        color: 0x330a12,
+        emissive: 0xff2040,
+        emissiveIntensity: 1.2,
+      }),
     );
-    this.composer.addPass(bloom);
-    this.composer.addPass(new OutputPass());
+    this.garbageBar.visible = false;
+    this.group.add(this.garbageBar);
 
-    window.addEventListener('resize', () => this.onResize());
-  }
-
-  // 盤面全体（フレーム込み）が必ず画面に収まるカメラ距離を計算する
-  private fitCamera(): void {
-    const aspect = window.innerWidth / window.innerHeight;
-    const halfH = VISIBLE / 2 + 2.0;
-    const halfW = COLS / 2 + 1.6;
-    const tan = Math.tan(THREE.MathUtils.degToRad(this.camera.fov / 2));
-    const zForHeight = halfH / tan;
-    const zForWidth = halfW / (tan * aspect);
-    this.camBase.z = Math.max(zForHeight, zForWidth) + 1;
-    this.camera.position.copy(this.camBase);
-    this.camera.lookAt(0, -0.2, 0);
+    this.buildStage();
+    this.bindGameEvents();
   }
 
   private worldX(c: number): number {
@@ -191,15 +140,13 @@ export class Renderer3D {
   }
 
   private buildStage(): void {
-    // 背面パネル
     const back = new THREE.Mesh(
       new THREE.PlaneGeometry(COLS + 1.2, VISIBLE + 1.2),
       new THREE.MeshStandardMaterial({ color: 0x070a16, metalness: 0.6, roughness: 0.7 }),
     );
     back.position.set(0, 0, -0.66);
-    this.scene.add(back);
+    this.group.add(back);
 
-    // グリッド線
     const gridPts: number[] = [];
     for (let c = 0; c <= COLS; c++) {
       const x = c - COLS / 2;
@@ -215,16 +162,9 @@ export class Renderer3D {
       gridGeo,
       new THREE.LineBasicMaterial({ color: 0x18244a, transparent: true, opacity: 0.65 }),
     );
-    this.scene.add(grid);
+    this.group.add(grid);
 
-    // ネオンフレーム
-    const mkBar = (
-      w: number,
-      h: number,
-      x: number,
-      y: number,
-      emissive: number,
-    ): void => {
+    const mkBar = (w: number, h: number, x: number, y: number, emissive: number): void => {
       const mat = new THREE.MeshStandardMaterial({
         color: 0x0b0e1c,
         emissive,
@@ -235,7 +175,7 @@ export class Renderer3D {
       this.frameMats.push(mat);
       const bar = new THREE.Mesh(new THREE.BoxGeometry(w, h, 1.1), mat);
       bar.position.set(x, y, 0);
-      this.scene.add(bar);
+      this.group.add(bar);
     };
     const half = COLS / 2 + 0.22;
     const vhalf = VISIBLE / 2 + 0.22;
@@ -243,34 +183,6 @@ export class Renderer3D {
     mkBar(0.34, VISIBLE + 0.9, half, 0, 0xff2fd0);
     mkBar(COLS + 1.14, 0.34, 0, -vhalf, 0x00d5ff);
     mkBar(COLS + 1.14, 0.34, 0, vhalf, 0xff2fd0);
-  }
-
-  private buildStarfield(): THREE.Points {
-    const n = 420;
-    const pos = new Float32Array(n * 3);
-    for (let i = 0; i < n; i++) {
-      const r = 40 + Math.random() * 55;
-      const theta = Math.random() * Math.PI * 2;
-      const phi = Math.acos(Math.random() * 2 - 1);
-      pos[i * 3] = r * Math.sin(phi) * Math.cos(theta);
-      pos[i * 3 + 1] = r * Math.sin(phi) * Math.sin(theta);
-      pos[i * 3 + 2] = -Math.abs(r * Math.cos(phi)) - 5;
-    }
-    const geo = new THREE.BufferGeometry();
-    geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
-    const pts = new THREE.Points(
-      geo,
-      new THREE.PointsMaterial({
-        color: 0x9db8ff,
-        size: 0.32,
-        transparent: true,
-        opacity: 0.75,
-        blending: THREE.AdditiveBlending,
-        depthWrite: false,
-      }),
-    );
-    this.scene.add(pts);
-    return pts;
   }
 
   private bindGameEvents(): void {
@@ -282,7 +194,7 @@ export class Renderer3D {
     });
     g.on('lock', () => {
       this.dirty = true;
-      this.shake = Math.max(this.shake, 0.03);
+      this.owner.addShake(0.03);
     });
     g.on('spawn', () => {
       this.activeSmoothed = null;
@@ -291,10 +203,20 @@ export class Renderer3D {
     g.on('hold', () => {
       this.activeSmoothed = null;
     });
+    g.on('garbage', (p) => {
+      const rows = p as number;
+      if (rows <= 0) return;
+      this.dirty = true;
+      this.owner.addShake(0.12 + rows * 0.05);
+      const grey = new THREE.Color(0x9aa4bd);
+      for (let c = 0; c < COLS; c += 2) {
+        this.spawnBurst(this.worldX(c), -VISIBLE / 2 + 0.5, grey, 8, 5.5);
+      }
+    });
     g.on('harddrop', (p) => {
       const dist = (p as { dist: number }).dist;
       if (dist <= 0) return;
-      this.shake = Math.max(this.shake, Math.min(0.05 + dist * 0.006, 0.16));
+      this.owner.addShake(Math.min(0.05 + dist * 0.006, 0.16));
       const { type, rot, x, y } = g.current;
       const color = new THREE.Color(COLORS[type]);
       for (const [cx, cy] of pieceCells(type, rot, x, y)) {
@@ -305,8 +227,8 @@ export class Renderer3D {
     g.on('clear', (payload) => {
       const info = payload as ClearInfo;
       const big = info.lines === 4 || info.tspin || info.pc;
-      const mega = info.tspin || info.pc; // T-spin・パフェは最大級の演出
-      this.shake = Math.max(this.shake, mega ? 0.95 : big ? 0.5 : 0.1 + info.lines * 0.06);
+      const mega = info.tspin || info.pc;
+      this.owner.addShake(mega ? 0.95 : big ? 0.5 : 0.1 + info.lines * 0.06);
       this.framePulse = mega ? 2.8 : big ? 1.8 : 0.8;
 
       const rowColor = new THREE.Color(info.tspin ? 0xd38bff : 0x9fdcff);
@@ -330,7 +252,6 @@ export class Renderer3D {
           : 0;
 
       if (mega) {
-        // 三重衝撃波＋大爆発＋ライトバースト
         const c1 = new THREE.Color(info.pc ? 0xffffff : 0xd38bff);
         const c2 = new THREE.Color(0xffffff);
         const c3 = new THREE.Color(info.pc ? 0xfff6ae : 0xff4fd8);
@@ -358,7 +279,7 @@ export class Renderer3D {
     g.on('gameover', () => {
       this.greyMode = true;
       this.dirty = true;
-      this.shake = 0.4;
+      this.owner.addShake(0.4);
     });
   }
 
@@ -374,7 +295,7 @@ export class Renderer3D {
       }),
     );
     mesh.position.set(0, this.worldY(row), 0.1);
-    this.scene.add(mesh);
+    this.group.add(mesh);
     this.flashes.push({ mesh, life: 0.32, max: 0.32 });
   }
 
@@ -408,7 +329,7 @@ export class Renderer3D {
       depthWrite: false,
     });
     const points = new THREE.Points(geo, mat);
-    this.scene.add(points);
+    this.group.add(points);
     this.bursts.push({ points, vel, life: 0.9, max: 0.9, mat });
   }
 
@@ -425,7 +346,7 @@ export class Renderer3D {
       }),
     );
     mesh.position.set(x, y, 0.6);
-    this.scene.add(mesh);
+    this.group.add(mesh);
     this.rings.push({ mesh, life, max: life });
   }
 
@@ -440,8 +361,7 @@ export class Renderer3D {
         if (this.greyMode) {
           this.tmpColor.setHex(0x3a4152);
         } else {
-          this.tmpColor.setHex(COLOR_BY_INDEX[v]);
-          // 発光感を出すため少し持ち上げる
+          this.tmpColor.setHex(COLOR_BY_INDEX[v] ?? 0xffffff);
           this.tmpColor.multiplyScalar(1.25);
         }
         this.lockedMesh.setColorAt(i, this.tmpColor);
@@ -453,7 +373,7 @@ export class Renderer3D {
     if (this.lockedMesh.instanceColor) this.lockedMesh.instanceColor.needsUpdate = true;
   }
 
-  render(dt: number): void {
+  update(dt: number): void {
     const g = this.game;
 
     if (this.dirty) {
@@ -461,7 +381,6 @@ export class Renderer3D {
       this.dirty = false;
     }
 
-    // 操作中ピース（スムーズ補間）
     const { type, rot, x, y } = g.current;
     const cells = pieceCells(type, rot, x, y);
     const show = !g.over;
@@ -475,7 +394,7 @@ export class Renderer3D {
       }));
     }
     const k = 1 - Math.exp(-20 * dt);
-    const topEdgeY = this.worldY(HIDDEN) + 0.55; // フレーム上端より上は描画しない
+    const topEdgeY = this.worldY(HIDDEN) + 0.55;
     for (let i = 0; i < 4; i++) {
       const box = this.activeBoxes[i];
       if (!show) {
@@ -492,7 +411,6 @@ export class Renderer3D {
       box.visible = s.y <= topEdgeY;
     }
 
-    // ゴースト
     const gd = g.ghostDistance();
     this.ghostMat.color.copy(color);
     for (let i = 0; i < 4; i++) {
@@ -503,14 +421,24 @@ export class Renderer3D {
       if (box.visible) box.position.set(this.worldX(cx), this.worldY(gy), 0);
     }
 
-    // エフェクト更新
+    // 受けているせり上がり警告バー
+    const pending = g.garbagePending();
+    if (pending > 0) {
+      const h = Math.min(pending, VISIBLE);
+      this.garbageBar.visible = true;
+      this.garbageBar.scale.y = h;
+      this.garbageBar.position.set(-(COLS / 2 + 0.75), -VISIBLE / 2 + h / 2, 0);
+    } else {
+      this.garbageBar.visible = false;
+    }
+
     this.flashes = this.flashes.filter((f) => {
       f.life -= dt;
       const t = Math.max(f.life / f.max, 0);
       (f.mesh.material as THREE.MeshBasicMaterial).opacity = t;
       f.mesh.scale.y = 0.4 + t * 0.6;
       if (f.life <= 0) {
-        this.scene.remove(f.mesh);
+        this.group.remove(f.mesh);
         f.mesh.geometry.dispose();
         (f.mesh.material as THREE.Material).dispose();
         return false;
@@ -531,7 +459,7 @@ export class Renderer3D {
       posAttr.needsUpdate = true;
       b.mat.opacity = Math.max(b.life / b.max, 0);
       if (b.life <= 0) {
-        this.scene.remove(b.points);
+        this.group.remove(b.points);
         b.points.geometry.dispose();
         b.mat.dispose();
         return false;
@@ -545,7 +473,7 @@ export class Renderer3D {
       r.mesh.scale.setScalar(1 + t * 9);
       (r.mesh.material as THREE.MeshBasicMaterial).opacity = (1 - t) * 0.9;
       if (r.life <= 0) {
-        this.scene.remove(r.mesh);
+        this.group.remove(r.mesh);
         r.mesh.geometry.dispose();
         (r.mesh.material as THREE.Material).dispose();
         return false;
@@ -553,20 +481,145 @@ export class Renderer3D {
       return true;
     });
 
-    // フレームの発光パルス
     this.framePulse = Math.max(this.framePulse - dt * 2.2, 0);
     for (const m of this.frameMats) {
       m.emissiveIntensity = 0.35 + this.framePulse * 1.5;
     }
 
-    // フラッシュライト減衰
     this.flashLight.intensity *= Math.exp(-dt * 7);
     if (this.flashLight.intensity < 1) this.flashLight.intensity = 0;
+  }
 
-    // 背景スターフィールド
+  dispose(scene: THREE.Scene): void {
+    this.group.traverse((obj) => {
+      const mesh = obj as THREE.Mesh;
+      if (mesh.geometry && mesh.geometry !== cellGeo) mesh.geometry.dispose();
+      const mat = (mesh as THREE.Mesh).material as THREE.Material | THREE.Material[];
+      if (mat) {
+        if (Array.isArray(mat)) mat.forEach((m) => m.dispose());
+        else mat.dispose();
+      }
+    });
+    scene.remove(this.group);
+  }
+}
+
+export class Renderer3D {
+  private renderer: THREE.WebGLRenderer;
+  private scene: THREE.Scene;
+  private camera: THREE.PerspectiveCamera;
+  private composer: EffectComposer;
+  private starfield: THREE.Points;
+  private views: BoardView[] = [];
+  private shake = 0;
+  private camBase = new THREE.Vector3(0, 1.6, 24);
+
+  constructor(container: HTMLElement) {
+    this.renderer = new THREE.WebGLRenderer({ antialias: true });
+    this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    this.renderer.setSize(window.innerWidth, window.innerHeight);
+    this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
+    this.renderer.toneMappingExposure = 1.15;
+    this.renderer.domElement.id = 'gl';
+    container.appendChild(this.renderer.domElement);
+
+    this.scene = new THREE.Scene();
+    this.scene.background = new THREE.Color(0x04050d);
+    this.scene.fog = new THREE.Fog(0x04050d, 40, 110);
+
+    this.camera = new THREE.PerspectiveCamera(
+      42,
+      window.innerWidth / window.innerHeight,
+      0.1,
+      200,
+    );
+
+    this.scene.add(new THREE.AmbientLight(0x8899ff, 0.5));
+    const dir = new THREE.DirectionalLight(0xffffff, 2.2);
+    dir.position.set(6, 12, 10);
+    this.scene.add(dir);
+    const p1 = new THREE.PointLight(0x00d5ff, 80, 0, 2);
+    p1.position.set(-12, 6, 9);
+    this.scene.add(p1);
+    const p2 = new THREE.PointLight(0xff2fd0, 80, 0, 2);
+    p2.position.set(12, -6, 9);
+    this.scene.add(p2);
+
+    this.starfield = this.buildStarfield();
+
+    this.composer = new EffectComposer(this.renderer);
+    this.composer.addPass(new RenderPass(this.scene, this.camera));
+    const bloom = new UnrealBloomPass(
+      new THREE.Vector2(window.innerWidth, window.innerHeight),
+      0.55,
+      0.45,
+      0.72,
+    );
+    this.composer.addPass(bloom);
+    this.composer.addPass(new OutputPass());
+
+    window.addEventListener('resize', () => this.onResize());
+  }
+
+  // ソロ=1盤面／対戦=2盤面に切り替える
+  setBoards(games: Game[]): void {
+    for (const v of this.views) v.dispose(this.scene);
+    const offsets = games.length === 2 ? [-VS_OFFSET, VS_OFFSET] : [0];
+    this.views = games.map((g, i) => new BoardView(this.scene, this, g, offsets[i]));
+    this.fitCamera();
+  }
+
+  addShake(v: number): void {
+    this.shake = Math.max(this.shake, v);
+  }
+
+  private buildStarfield(): THREE.Points {
+    const n = 420;
+    const pos = new Float32Array(n * 3);
+    for (let i = 0; i < n; i++) {
+      const r = 40 + Math.random() * 55;
+      const theta = Math.random() * Math.PI * 2;
+      const phi = Math.acos(Math.random() * 2 - 1);
+      pos[i * 3] = r * Math.sin(phi) * Math.cos(theta);
+      pos[i * 3 + 1] = r * Math.sin(phi) * Math.sin(theta);
+      pos[i * 3 + 2] = -Math.abs(r * Math.cos(phi)) - 5;
+    }
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+    const pts = new THREE.Points(
+      geo,
+      new THREE.PointsMaterial({
+        color: 0x9db8ff,
+        size: 0.32,
+        transparent: true,
+        opacity: 0.75,
+        blending: THREE.AdditiveBlending,
+        depthWrite: false,
+      }),
+    );
+    this.scene.add(pts);
+    return pts;
+  }
+
+  // 全盤面（フレーム込み）が必ず画面に収まるカメラ距離を計算する
+  private fitCamera(): void {
+    const aspect = window.innerWidth / window.innerHeight;
+    const halfH = VISIBLE / 2 + 2.0;
+    const halfW =
+      this.views.length === 2 ? VS_OFFSET + COLS / 2 + 1.6 : COLS / 2 + 1.6;
+    const tan = Math.tan(THREE.MathUtils.degToRad(this.camera.fov / 2));
+    const zForHeight = halfH / tan;
+    const zForWidth = halfW / (tan * aspect);
+    this.camBase.z = Math.max(zForHeight, zForWidth) + 1;
+    this.camera.position.copy(this.camBase);
+    this.camera.lookAt(0, -0.2, 0);
+  }
+
+  render(dt: number): void {
+    for (const v of this.views) v.update(dt);
+
     this.starfield.rotation.z += dt * 0.012;
 
-    // 画面シェイク
     this.shake *= Math.exp(-dt * 5.5);
     this.camera.position.set(
       this.camBase.x + (Math.random() - 0.5) * this.shake,

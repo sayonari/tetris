@@ -26,6 +26,7 @@ export type ComboPhase = 'build' | 'clear';
 export interface StrategyState {
   strategy: EvalStrategy;
   phase: ComboPhase;
+  tAvail?: number; // 近い将来使えるTミノの数（ホールド＋ネクスト、最大2）
 }
 
 type PathAction = 'left' | 'right' | 'cw' | 'ccw' | 'down';
@@ -42,6 +43,7 @@ const W = {
 
 const COMBO_WELL = 3; // 左3列を温存
 const TETRIS_WELL = COLS - 1; // 右端1列を温存
+export const TSPIN_NOTCH = 2; // T-spin工場のノッチ（谷）列（LST積みの定石＝3列目）
 
 export function boardMaxHeight(g: number[][], fromCol = 0, toCol = COLS - 1): number {
   let h = 0;
@@ -63,6 +65,24 @@ function readyRowsTetris(g: number[][]): number {
     if (g[r][TETRIS_WELL] !== 0) continue;
     let full = true;
     for (let c = 0; c < TETRIS_WELL; c++) {
+      if (g[r][c] === 0) {
+        full = false;
+        break;
+      }
+    }
+    if (full) n++;
+  }
+  return n;
+}
+
+// tspin用：ノッチ列以外が全部埋まった「TSDの弾」になる行の数
+function readyRowsTspin(g: number[][], tc: number): number {
+  let n = 0;
+  for (let r = 0; r < ROWS; r++) {
+    if (g[r][tc] !== 0) continue;
+    let full = true;
+    for (let c = 0; c < COLS; c++) {
+      if (c === tc) continue;
       if (g[r][c] === 0) {
         full = false;
         break;
@@ -108,15 +128,19 @@ function linesIfPlaced(g: number[][], cells: [number, number][]): number {
   return n;
 }
 
-// T出現位置から「スピン入れ（最後が回転）でTSD以上」が実際に可能か検証するBFS。
+// T出現位置から「スピン入れ（最後が回転）」で実際に到達できる設置のうち
+// 最も消去ライン数が多いものを探すBFS。
 // 幾何判定だけでは「スピンで入れないニセスロット」を拾ってしまうため、これが真実。
-export function spinTSDReachable(grid: number[][]): boolean {
+export function findSpinPlacement(
+  grid: number[][],
+): { cells: [number, number][]; lines: number } | null {
   const start = spawnPiece('T');
-  if (collides(grid, 'T', start.rot, start.x, start.y)) return false;
+  if (collides(grid, 'T', start.rot, start.x, start.y)) return null;
   const nodes: { x: number; y: number; rot: number }[] = [
     { x: start.x, y: start.y, rot: start.rot },
   ];
   const seen = new Set<number>([stateKey(start.x, start.y, start.rot)]);
+  let best: { cells: [number, number][]; lines: number } | null = null;
   for (let i = 0; i < nodes.length && nodes.length < 1500; i++) {
     const n = nodes[i];
     const push = (x: number, y: number, rot: number, viaSpin: boolean): boolean => {
@@ -125,28 +149,56 @@ export function spinTSDReachable(grid: number[][]): boolean {
       seen.add(k);
       nodes.push({ x, y, rot });
       if (viaSpin && collides(grid, 'T', rot, x, y + 1) && countTCorners(grid, x, y) >= 3) {
-        if (linesIfPlaced(grid, pieceCells('T', rot, x, y)) >= 2) return true;
+        const cells = pieceCells('T', rot, x, y);
+        const lines = linesIfPlaced(grid, cells);
+        if (lines >= 1 && (!best || lines > best.lines)) best = { cells, lines };
+        if (lines >= 3) return true; // TSTが見つかれば打ち切り
       }
       return false;
     };
     for (const dir of [1, -1] as const) {
       const r = attemptRotation(grid, { type: 'T', rot: n.rot, x: n.x, y: n.y }, dir);
-      if (r && push(r.x, r.y, r.rot, true)) return true;
+      if (r && push(r.x, r.y, r.rot, true)) return best;
     }
     for (const dx of [-1, 1]) {
       if (!collides(grid, 'T', n.rot, n.x + dx, n.y)) push(n.x + dx, n.y, n.rot, false);
     }
     if (!collides(grid, 'T', n.rot, n.x, n.y + 1)) push(n.x, n.y + 1, n.rot, false);
   }
-  return false;
+  return best;
 }
 
-// 盤面のT-spinスロット評価（構築・維持ボーナス用）。
-// 「あと数セルで完成する」近似スロットに段階的に加点して構築の勾配を作り、
-// 完成形はBFSで実際にスピン入れ可能なものだけ高評価する。
+// Cold Clear流の多段先読み：使えるTの数だけ「スロット検出→仮想消去→再検出」を
+// 繰り返し、多段に仕込まれたスロット全てに加点する。
+// これにより「TSDの下に次のTSDがある」LST的な形を自発的に構築するようになる。
+const TSLOT_CHAIN_REWARD = [0, 26, 90, 160];
+function tSlotChainBonus(g: number[][], tAvail: number): number {
+  let total = 0;
+  let board = g;
+  for (let k = 0; k < tAvail; k++) {
+    const found = findSpinPlacement(board);
+    if (!found || found.lines < 1) break;
+    total += TSLOT_CHAIN_REWARD[Math.min(found.lines, 3)];
+    if (found.lines < 2 && k === 0) break; // TSS形どまりなら深追いしない
+    board = board.map((row) => row.slice());
+    for (const [cx, cy] of found.cells) {
+      if (cy >= 0) board[cy][cx] = 1;
+    }
+    for (let r = 0; r < ROWS; r++) {
+      if (board[r].every((c) => c !== 0)) {
+        board.splice(r, 1);
+        board.unshift(Array(COLS).fill(0));
+      }
+    }
+  }
+  return total;
+}
+
+// 盤面のT-spinスロット「未完成形」への構築勾配ボーナス。
+// 完成形（実際にスピン入れ可能）の評価は tSlotChainBonus が担当するので、
+// ここでは「あと数セルで完成する」近似形にのみ段階加点する。
 export function tSlotBonus(g: number[][]): number {
   let best = 0;
-  let geomFull = false;
   for (const rot of [1, 2, 3]) {
     for (let x = -1; x < COLS - 1; x++) {
       for (let y = 0; y < ROWS - 2; y++) {
@@ -169,9 +221,8 @@ export function tSlotBonus(g: number[][]): number {
           else missing += empty;
         }
         if (nCorners >= 3) {
-          if (fullRows >= 2) geomFull = true;
-          else if (fullRows === 1 && missing <= 3) best = Math.max(best, 40 - 7 * missing);
-          else if (missing <= 4) best = Math.max(best, 18 - 3 * missing);
+          if (fullRows === 1 && missing <= 3) best = Math.max(best, 40 - 7 * missing);
+          else if (fullRows < 2 && missing <= 4) best = Math.max(best, 18 - 3 * missing);
         } else {
           // 底2コーナー＋ノッチ形状のみ（あとは屋根を乗せればスロット完成）
           if (fullRows === 2) best = Math.max(best, 38);
@@ -180,7 +231,6 @@ export function tSlotBonus(g: number[][]): number {
       }
     }
   }
-  if (geomFull && spinTSDReachable(g)) return 60;
   return best;
 }
 
@@ -272,19 +322,63 @@ function evaluatePlacement(
       bonus += cleared * 20;
       break;
 
-    case 'tspin':
+    case 'tspin': {
       if (isSpin) {
         // TSSは弱く、TSD/TSTを強烈に優遇して「2列揃うまで待つ」動機付け
         if (cleared === 1) bonus += 10;
         else if (cleared === 2) bonus += 260;
         else if (cleared >= 3) bonus += 500;
-      } else if (cleared === 1 && maxH < 12) {
-        bonus -= 4;
-      } else if (cleared === 4) {
-        bonus += 50;
+      } else {
+        // T-spin工場方式：ノッチ列は聖域（LST積みの定石＝3列目を井戸兼ノッチに）
+        const inNotch = cells.filter(([cx]) => cx === TSPIN_NOTCH).length;
+        bonus -= 50 * inNotch;
+        if (type === 'T') bonus -= 22; // wasted T（Cold Clear流：Tの無駄遣いは罰）
+        if (cleared > 0 && cleared < 4 && maxH < 13) bonus -= [0, 10, 7, 4][cleared];
+        else if (cleared === 4) bonus += 50;
       }
+
+      // Cold Clear流：屋根由来の「横から開いた穴」は完全閉塞穴より軽罰にする
+      // （これを怠るとAIはT-spinの屋根を作れない）
+      {
+        const topRow: number[] = [];
+        for (let c = 0; c < COLS; c++) {
+          let t = ROWS;
+          for (let r = 0; r < ROWS; r++) {
+            if (g[r][c] !== 0) {
+              t = r;
+              break;
+            }
+          }
+          topRow.push(t);
+        }
+        let overhangs = 0;
+        for (let c = 0; c < COLS; c++) {
+          for (let r = topRow[c] + 1; r < ROWS; r++) {
+            if (g[r][c] !== 0) continue;
+            const openLeft = c > 0 && topRow[c - 1] > r;
+            const openRight = c < COLS - 1 && topRow[c + 1] > r;
+            if (openLeft || openRight) overhangs++;
+          }
+        }
+        bonus += 5.0 * overhangs; // holes(-7.9)を実質-2.9まで緩和
+
+        // ノッチ両壁の高さが揃い、ノッチが1段深い「完璧な谷」を維持
+        const h = (c: number) => ROWS - topRow[c];
+        if (TSPIN_NOTCH > 0 && TSPIN_NOTCH < COLS - 1) {
+          if (h(TSPIN_NOTCH - 1) === h(TSPIN_NOTCH + 1) && h(TSPIN_NOTCH) < h(TSPIN_NOTCH - 1))
+            bonus += 10;
+          if (h(TSPIN_NOTCH - 1) === h(TSPIN_NOTCH) + 1) bonus += 8;
+        }
+      }
+
+      // ノッチ列以外が埋まった行＝TSDの弾。多いほど良い
+      bonus += Math.min(readyRowsTspin(g, TSPIN_NOTCH), 4) * 12;
+      // 未完成スロットへの構築勾配
       bonus += tSlotBonus(g);
+      // 多段Tスロット先読み（Cold Clear流の連発評価）
+      if (maxH < 15) bonus += tSlotChainBonus(g, Math.max(st.tAvail ?? 1, 1));
       break;
+    }
 
     case 'combo': {
       const inWell = cells.filter(([cx]) => cx < COMBO_WELL).length;
@@ -431,6 +525,13 @@ export interface PlanResult {
 
 // ホールド活用込みの1手プラン（AutoPlayerとシミュレータの両方から使う）
 export function planMove(game: Game, st: StrategyState, allowDown: boolean): PlanResult {
+  // 近い将来使えるTの数（ホールド＋ネクスト7個、最大2）
+  if (st.strategy === 'tspin') {
+    let t = game.holdType === 'T' ? 1 : 0;
+    if (game.current.type === 'T') t++;
+    t += game.nextTypes(7).filter((p) => p === 'T').length;
+    st.tAvail = Math.min(t, 2);
+  }
   const cur = findBest(game.grid, game.current, allowDown, st);
   let plan: PlanResult & { score: number } = cur
     ? {

@@ -23,7 +23,8 @@ export const COLORS: Record<PieceType, number> = {
   L: 0xf0a000,
 };
 
-export const COLOR_BY_INDEX: number[] = [0, ...PIECE_TYPES.map((t) => COLORS[t])];
+export const GARBAGE_INDEX = 8; // せり上がりブロック（グレー）
+export const COLOR_BY_INDEX: number[] = [0, ...PIECE_TYPES.map((t) => COLORS[t]), 0x6a7285];
 
 export function colorIndexOf(type: PieceType): number {
   return PIECE_TYPES.indexOf(type) + 1;
@@ -217,6 +218,9 @@ export class Game extends Emitter {
   private lastRotate = false;
   private lastKick = 0;
 
+  // 対戦用：受けているせり上がり（バッチごとに穴位置を持つ）
+  private garbageQueue: { rows: number; hole: number }[] = [];
+
   constructor() {
     super();
     this.reset();
@@ -241,9 +245,59 @@ export class Game extends Emitter {
     this.lockResets = 0;
     this.softDropping = false;
     this.lastRotate = false;
+    this.garbageQueue = [];
     this.spawnNext();
     this.emit('reset');
     this.emit('score');
+  }
+
+  // ---- 対戦（せり上がり） ----
+
+  garbagePending(): number {
+    return this.garbageQueue.reduce((s, g) => s + g.rows, 0);
+  }
+
+  // 相手からの攻撃を受け取る（次のロック後にせり上がる）
+  addGarbage(rows: number): void {
+    if (rows <= 0) return;
+    this.garbageQueue.push({ rows, hole: Math.floor(Math.random() * COLS) });
+    this.emit('garbagewarn', this.garbagePending());
+  }
+
+  // 自分の攻撃でまず受けを相殺し、残った攻撃力を返す
+  cancelGarbage(power: number): number {
+    while (power > 0 && this.garbageQueue.length > 0) {
+      const head = this.garbageQueue[0];
+      const used = Math.min(power, head.rows);
+      head.rows -= used;
+      power -= used;
+      if (head.rows === 0) this.garbageQueue.shift();
+    }
+    this.emit('garbagewarn', this.garbagePending());
+    return power;
+  }
+
+  // ロック後（ライン消去なしの時）にせり上げを適用
+  private applyGarbage(): void {
+    let toApply = Math.min(this.garbagePending(), 8); // 1回のせり上げ上限
+    if (toApply <= 0) return;
+    let applied = 0;
+    while (toApply > 0 && this.garbageQueue.length > 0) {
+      const head = this.garbageQueue[0];
+      const n = Math.min(toApply, head.rows);
+      for (let i = 0; i < n; i++) {
+        this.grid.shift();
+        const row = Array(COLS).fill(GARBAGE_INDEX);
+        row[head.hole] = 0;
+        this.grid.push(row);
+      }
+      head.rows -= n;
+      toApply -= n;
+      applied += n;
+      if (head.rows === 0) this.garbageQueue.shift();
+    }
+    this.emit('garbage', applied);
+    this.emit('garbagewarn', this.garbagePending());
   }
 
   gravitySec(): number {
@@ -502,6 +556,9 @@ export class Game extends Emitter {
       this.gameOver();
       return;
     }
+
+    // 消去できなかったターンにせり上がりが入る（ガイドライン系対戦の標準挙動）
+    if (lines === 0) this.applyGarbage();
 
     this.canHold = true;
     this.spawnNext();

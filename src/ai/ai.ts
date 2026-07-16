@@ -9,6 +9,7 @@
 import {
   ActivePiece,
   COLS,
+  ClearInfo,
   Game,
   PieceType,
   ROWS,
@@ -362,12 +363,17 @@ function evaluatePlacement(
         }
         bonus += 5.0 * overhangs; // holes(-7.9)を実質-2.9まで緩和
 
-        // ノッチ両壁の高さが揃い、ノッチが1段深い「完璧な谷」を維持
+        // ノッチ両壁の高さが揃い、ノッチが「ちょうど1段」深い完璧な谷を維持。
+        // 深すぎる谷はTSDにならない（TST用の深さ2まで許容、それ以上は減点）
         const h = (c: number) => ROWS - topRow[c];
         if (TSPIN_NOTCH > 0 && TSPIN_NOTCH < COLS - 1) {
-          if (h(TSPIN_NOTCH - 1) === h(TSPIN_NOTCH + 1) && h(TSPIN_NOTCH) < h(TSPIN_NOTCH - 1))
-            bonus += 10;
-          if (h(TSPIN_NOTCH - 1) === h(TSPIN_NOTCH) + 1) bonus += 8;
+          const wallL = h(TSPIN_NOTCH - 1);
+          const wallR = h(TSPIN_NOTCH + 1);
+          const depth = Math.min(wallL, wallR) - h(TSPIN_NOTCH);
+          if (wallL === wallR && depth > 0) bonus += 12;
+          if (depth === 1) bonus += 14;
+          else if (depth === 2) bonus += 5;
+          else if (depth >= 3) bonus -= 4;
         }
       }
 
@@ -426,20 +432,22 @@ export interface BestResult {
   path: PathAction[];
   cleared: number;
   spin: boolean;
+  cells: [number, number][];
 }
 
 function stateKey(x: number, y: number, rot: number): number {
   return (rot * 48 + (y + 8)) * 48 + (x + 8);
 }
 
-export function findBest(
+function searchPlacements(
   grid: number[][],
   start: ActivePiece,
   allowDown: boolean,
   st: StrategyState,
-): BestResult | null {
+  topK: number,
+): BestResult[] {
   const { type } = start;
-  if (collides(grid, type, start.rot, start.x, start.y)) return null;
+  if (collides(grid, type, start.rot, start.x, start.y)) return [];
 
   const nodes: Node[] = [{ x: start.x, y: start.y, rot: start.rot, parent: -1, action: null }];
   const seen = new Set<number>([stateKey(start.x, start.y, start.rot)]);
@@ -490,30 +498,63 @@ export function findBest(
     }
   }
 
-  let best: {
-    score: number;
-    nodeIdx: number;
-    p: { rot: number; x: number; y: number; spinFinal: boolean };
-  } | null = null;
-  for (const p of placements.values()) {
-    const score = evaluatePlacement(grid, type, p.rot, p.x, p.y, p.spinFinal, st);
-    if (!best || score > best.score) best = { score, nodeIdx: p.nodeIdx, p };
-  }
-  if (!best) return null;
+  const scored = [...placements.values()].map((p) => ({
+    p,
+    score: evaluatePlacement(grid, type, p.rot, p.x, p.y, p.spinFinal, st),
+  }));
+  scored.sort((a, b) => b.score - a.score);
 
-  const path: PathAction[] = [];
-  let idx = best.nodeIdx;
-  while (idx >= 0) {
-    const n = nodes[idx];
-    if (n.action) path.push(n.action);
-    idx = n.parent;
-  }
-  path.reverse();
+  const buildResult = (s: (typeof scored)[0]): BestResult => {
+    const path: PathAction[] = [];
+    let idx = s.p.nodeIdx;
+    while (idx >= 0) {
+      const n = nodes[idx];
+      if (n.action) path.push(n.action);
+      idx = n.parent;
+    }
+    path.reverse();
+    const cells = pieceCells(type, s.p.rot, s.p.x, s.p.y);
+    const cleared = linesIfPlaced(grid, cells);
+    const spin = type === 'T' && s.p.spinFinal && countTCorners(grid, s.p.x, s.p.y) >= 3;
+    return { score: s.score, path, cleared, spin, cells };
+  };
 
-  const cleared = linesIfPlaced(grid, pieceCells(type, best.p.rot, best.p.x, best.p.y));
-  const spin =
-    type === 'T' && best.p.spinFinal && countTCorners(grid, best.p.x, best.p.y) >= 3;
-  return { score: best.score, path, cleared, spin };
+  return scored.slice(0, topK).map(buildResult);
+}
+
+export function findBest(
+  grid: number[][],
+  start: ActivePiece,
+  allowDown: boolean,
+  st: StrategyState,
+): BestResult | null {
+  return searchPlacements(grid, start, allowDown, st, 1)[0] ?? null;
+}
+
+// findBestの上位K件版（2手読みビームサーチ用）
+export function findTopPlacements(
+  grid: number[][],
+  start: ActivePiece,
+  allowDown: boolean,
+  st: StrategyState,
+  k: number,
+): BestResult[] {
+  return searchPlacements(grid, start, allowDown, st, k);
+}
+
+// 設置を盤面に適用（消去込み）した新しい盤面を返す
+export function applyPlacement(grid: number[][], cells: [number, number][]): number[][] {
+  const g = grid.map((row) => row.slice());
+  for (const [cx, cy] of cells) {
+    if (cy >= 0) g[cy][cx] = 1;
+  }
+  for (let r = 0; r < ROWS; r++) {
+    if (g[r].every((c) => c !== 0)) {
+      g.splice(r, 1);
+      g.unshift(Array(COLS).fill(0));
+    }
+  }
+  return g;
 }
 
 export interface PlanResult {
@@ -524,7 +565,14 @@ export interface PlanResult {
 }
 
 // ホールド活用込みの1手プラン（AutoPlayerとシミュレータの両方から使う）
-export function planMove(game: Game, st: StrategyState, allowDown: boolean): PlanResult {
+// deep=true でT-spin戦略時に2手読みまで行う（シミュレータ用。ブラウザの
+// AutoPlayerは deep=false で呼び、自前でフレーム分割しながら2手読みする）
+export function planMove(
+  game: Game,
+  st: StrategyState,
+  allowDown: boolean,
+  deep = true,
+): PlanResult {
   // 近い将来使えるTの数（ホールド＋ネクスト7個、最大2）
   if (st.strategy === 'tspin') {
     let t = game.holdType === 'T' ? 1 : 0;
@@ -565,6 +613,33 @@ export function planMove(game: Game, st: StrategyState, allowDown: boolean): Pla
       }
     }
   }
+
+  // T-spin戦略のみ2手読み：上位候補それぞれについて「次ミノの最善手」まで
+  // 評価し、2手合計が最も良い候補を選ぶ（スロット構築が段違いに速くなる）
+  if (deep && !plan.hold && st.strategy === 'tspin') {
+    const opts = findTopPlacements(game.grid, game.current, allowDown, st, 5);
+    if (opts.length > 1) {
+      const next = game.nextTypes(1)[0];
+      let bestTotal = -Infinity;
+      let bestOpt = opts[0];
+      for (const o of opts) {
+        const board = applyPlacement(game.grid, o.cells);
+        const n2 = findBest(board, spawnPiece(next), false, st);
+        const total = o.score * 0.3 + (n2 ? n2.score : -400);
+        if (total > bestTotal) {
+          bestTotal = total;
+          bestOpt = o;
+        }
+      }
+      plan = {
+        hold: false,
+        path: [...bestOpt.path, 'drop'],
+        score: bestOpt.score,
+        cleared: bestOpt.cleared,
+        spin: bestOpt.spin,
+      };
+    }
+  }
   return plan;
 }
 
@@ -587,7 +662,14 @@ const BTN_OF: Record<PlanAction, Btn> = {
 };
 
 const ROTATION: StrategyId[] = ['tspin', 'combo', 'tetris'];
-const PIECES_PER_STRATEGY = 30;
+// 戦略は「成果を出すまで」続ける（早すぎる切替を防ぐ）
+const STRATEGY_MIN_PIECES = 24; // 成果達成後でもこれ未満では切り替えない
+const STRATEGY_CAP_PIECES = 75; // 成果が出なくてもこれで打ち切り
+const PAYOFF_TARGET: Record<StrategyId, number> = {
+  tspin: 3, // TSD/TST 3回
+  combo: 1, // 連鎖サイクル1回完遂
+  tetris: 2, // テトリス2回
+};
 
 export class AutoPlayer {
   enabled = false;
@@ -598,10 +680,20 @@ export class AutoPlayer {
 
   private phase: ComboPhase = 'build';
   private piecesInStrategy = 0;
+  private payoff = 0; // 現戦略での成果（大技）回数
   private survival = false;
   private actions: PlanAction[] = [];
   private timer = 0;
   private pressedQueue: { btn: Btn; t: number }[] = [];
+  // 2手読みのフレーム分割状態（1フレームに1候補だけ評価してカクつきを防ぐ）
+  private pendingDeep: {
+    opts: BestResult[];
+    idx: number;
+    bestTotal: number;
+    bestOpt: BestResult;
+    next: PieceType;
+    st: StrategyState;
+  } | null = null;
 
   constructor(
     private game: Game,
@@ -610,8 +702,15 @@ export class AutoPlayer {
     game.on('spawn', () => this.replan());
     game.on('reset', () => {
       this.piecesInStrategy = 0;
+      this.payoff = 0;
       this.survival = false;
       this.phase = 'build';
+    });
+    game.on('clear', (p) => {
+      if (!this.enabled) return;
+      const info = p as ClearInfo;
+      if (this.strategy === 'tspin' && info.tspin && info.lines >= 2) this.payoff++;
+      else if (this.strategy === 'tetris' && info.lines === 4) this.payoff++;
     });
   }
 
@@ -629,8 +728,29 @@ export class AutoPlayer {
     const others = ROTATION.filter((s) => s !== this.strategy);
     this.strategy = others[Math.floor(Math.random() * others.length)];
     this.piecesInStrategy = 0;
+    this.payoff = 0;
     this.phase = 'build';
     this.onStrategyChange?.(this.strategy);
+  }
+
+  // 成果ベースの戦略切替：目標達成 or 上限到達で切替。ただし「仕込みの回収直前」は延期
+  private maybeRotateStrategy(): void {
+    const g = this.game;
+    const done = this.payoff >= PAYOFF_TARGET[this.strategy];
+    const capped = this.piecesInStrategy > STRATEGY_CAP_PIECES;
+    if (!capped && (!done || this.piecesInStrategy < STRATEGY_MIN_PIECES)) return;
+
+    if (!capped) {
+      // 投資回収の直前なら切り替えを延期する
+      if (this.strategy === 'combo' && this.phase === 'clear') return;
+      if (this.strategy === 'tspin') {
+        const tSoon =
+          g.current.type === 'T' || g.holdType === 'T' || g.nextTypes(3).includes('T');
+        const slot = findSpinPlacement(g.grid);
+        if (tSoon && slot && slot.lines >= 2) return;
+      }
+    }
+    this.rotateStrategy();
   }
 
   private replan(): void {
@@ -642,7 +762,7 @@ export class AutoPlayer {
     if (g.over) return;
 
     this.piecesInStrategy++;
-    if (this.piecesInStrategy > PIECES_PER_STRATEGY) this.rotateStrategy();
+    this.maybeRotateStrategy();
 
     // 危険検知 → 立て直しモード
     const maxH = boardMaxHeight(g.grid);
@@ -658,6 +778,7 @@ export class AutoPlayer {
       const np = nextComboPhase(g.grid, this.phase);
       if (np !== this.phase) {
         this.phase = np;
+        if (np === 'build') this.payoff++; // 連鎖サイクル1回完遂
         this.onFeeling?.(np === 'clear' ? 'combo.go' : 'combo.build');
       }
     }
@@ -667,7 +788,8 @@ export class AutoPlayer {
       phase: this.phase,
     };
     const allowDown = g.gravitySec() > 0.18;
-    const plan = planMove(g, st, allowDown);
+    this.pendingDeep = null;
+    const plan = planMove(g, st, allowDown, false);
 
     if (plan.hold) {
       if (Math.random() < 0.35) this.onFeeling?.('hold.keep');
@@ -682,6 +804,22 @@ export class AutoPlayer {
     }
 
     this.actions = plan.hold ? ['hold'] : plan.path;
+
+    // T-spin戦略は2手読みをフレーム分割で実行（結果が出るまで手を止める）
+    if (!plan.hold && st.strategy === 'tspin') {
+      const opts = findTopPlacements(g.grid, g.current, allowDown, st, 5);
+      if (opts.length > 1) {
+        this.pendingDeep = {
+          opts,
+          idx: 0,
+          bestTotal: -Infinity,
+          bestOpt: opts[0],
+          next: g.nextTypes(1)[0],
+          st,
+        };
+        this.actions = [];
+      }
+    }
   }
 
   step(dt: number): void {
@@ -696,6 +834,26 @@ export class AutoPlayer {
     });
 
     if (!this.enabled || !this.game.playing || this.game.over) return;
+
+    // 2手読みの続き：1フレームに1候補だけ評価
+    if (this.pendingDeep) {
+      const pd = this.pendingDeep;
+      const o = pd.opts[pd.idx];
+      const board = applyPlacement(this.game.grid, o.cells);
+      const n2 = findBest(board, spawnPiece(pd.next), false, pd.st);
+      const total = o.score * 0.3 + (n2 ? n2.score : -400);
+      if (total > pd.bestTotal) {
+        pd.bestTotal = total;
+        pd.bestOpt = o;
+      }
+      pd.idx++;
+      if (pd.idx >= pd.opts.length) {
+        this.actions = [...pd.bestOpt.path, 'drop'];
+        this.pendingDeep = null;
+      }
+      return;
+    }
+
     this.timer -= dt;
     if (this.timer > 0 || this.actions.length === 0) return;
 
